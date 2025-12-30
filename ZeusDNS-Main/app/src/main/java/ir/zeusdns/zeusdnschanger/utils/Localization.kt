@@ -125,7 +125,14 @@ object Localization {
         "ping_failed" to "Ping Failed",
         "ping_success" to "Ping Success",
         "ping_idle" to "Click to test ping",
-        "auto_ping_on_start" to "Auto ping on start"
+        "auto_ping_on_start" to "Auto ping on start",
+        "auto_update_title" to "Auto Update IP",
+        "auto_update_desc" to "Check & update in background",
+        "stop_auto_update" to "Stop Auto Update",
+        "monitoring_ip" to "Monitoring IP changes...",
+        "service_started" to "Monitoring IP service started",
+        "service_stopped" to "Monitoring IP service stopped",
+        "update_interval" to "Update Interval"
     )
 
     private val persianStrings = mapOf(
@@ -249,7 +256,14 @@ object Localization {
         "ping_failed" to "پینگ ناموفق",
         "ping_success" to "پینگ موفق",
         "ping_idle" to "برای تست پینگ کلیک کنید",
-        "auto_ping_on_start" to "پینگ خودکار هنگام شروع"
+        "auto_ping_on_start" to "پینگ خودکار هنگام شروع",
+        "auto_update_title" to "بروزرسانی خودکار آی‌پی",
+        "auto_update_desc" to "بررسی و تغییر در پس‌زمینه",
+        "stop_auto_update" to "توقف بروزرسانی خودکار",
+        "monitoring_ip" to "در حال پایش تغییرات آی‌پی...",
+        "service_started" to "سرویس پایش آی‌پی فعال شد",
+        "service_stopped" to "سرویس پایش آی‌پی متوقف شد",
+        "update_interval" to "بازه زمانی آپدیت"
     )
 
     fun getString(key: String, viewModel: MainViewModel): String {

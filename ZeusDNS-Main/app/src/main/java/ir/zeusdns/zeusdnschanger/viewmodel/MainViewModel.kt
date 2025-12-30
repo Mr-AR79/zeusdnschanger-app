@@ -14,10 +14,13 @@ import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import ir.zeusdns.zeusdnschanger.MyVpnService
+import ir.zeusdns.zeusdnschanger.IpUpdateService
 import ir.zeusdns.zeusdnschanger.VpnStatusManager
 import ir.zeusdns.zeusdnschanger.data.AppSettings
 import ir.zeusdns.zeusdnschanger.data.DnsServerGroup
 import ir.zeusdns.zeusdnschanger.data.PingResult
+import ir.zeusdns.zeusdnschanger.utils.*
+import ir.zeusdns.zeusdnschanger.IpUpdateStatusManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -25,6 +28,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import androidx.compose.runtime.mutableIntStateOf
+import ir.zeusdns.zeusdnschanger.data.ToastData
+import ir.zeusdns.zeusdnschanger.data.ToastType
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import java.net.URL
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs = application.getSharedPreferences("ZeusDNS_Prefs", Context.MODE_PRIVATE)
@@ -61,12 +70,211 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var cacheSize by mutableStateOf("0 KB")
         private set
 
+    var userToken = mutableStateOf("")
+    var liveIpAddress = mutableStateOf<String?>(null)
+    var executionResult = mutableStateOf<String?>(null)
+    var isSuccessResult = mutableStateOf(false)
+
+    var isAutoUpdateActive = mutableStateOf(false)
+    var isAutoUpdateEnabledToggle = mutableStateOf(false)
+    var updateIntervalMinutes = mutableIntStateOf(prefs.getInt("update_interval", 1))
+        private set
+    private var lastRegisteredIp: String? = null
+    private var updateJob: Job? = null
+
     private val _pingUpdateTrigger = MutableStateFlow(0)
     val pingUpdateTrigger: StateFlow<Int> = _pingUpdateTrigger
+
+    private val _freePrimaryStatus = MutableStateFlow("idle")
+    private val _freePrimaryTime = MutableStateFlow<String?>(null)
+    private val _freePrimaryError = MutableStateFlow<String?>(null)
+    private val _freeSecondaryStatus = MutableStateFlow("idle")
+    private val _freeSecondaryTime = MutableStateFlow<String?>(null)
+    private val _freeSecondaryError = MutableStateFlow<String?>(null)
+
+    private val _proPrimaryStatus = MutableStateFlow("idle")
+    private val _proPrimaryTime = MutableStateFlow<String?>(null)
+    private val _proPrimaryError = MutableStateFlow<String?>(null)
+    private val _proSecondaryStatus = MutableStateFlow("idle")
+    private val _proSecondaryTime = MutableStateFlow<String?>(null)
+    private val _proSecondaryError = MutableStateFlow<String?>(null)
+
+    private val _vpnStatus = MutableStateFlow(false)
+    val vpnStatus: StateFlow<Boolean> = _vpnStatus
+
+    private val _toastEvent = MutableSharedFlow<ToastData>()
+    val toastEvent = _toastEvent.asSharedFlow()
 
     init {
         loadCustomDns()
         updateCacheSize()
+
+        viewModelScope.launch {
+            IpUpdateStatusManager.isServiceRunning.collect { isRunning ->
+                isAutoUpdateActive.value = isRunning
+                if (isRunning) {
+                    isAutoUpdateEnabledToggle.value = true
+                }
+            }
+        }
+        val savedToken = prefs.getString("saved_auto_update_token", "") ?: ""
+        if (savedToken.isNotEmpty()) {
+            userToken.value = savedToken
+        }
+        viewModelScope.launch {
+            IpUpdateStatusManager.lastKnownIp.collect { ip ->
+                if (ip != null) {
+                    liveIpAddress.value = ip
+                }
+            }
+        }
+
+        viewModelScope.launch {
+            IpUpdateStatusManager.lastExecutionResult.collect { rawResult ->
+                if (rawResult != null) {
+                    val currentIp = liveIpAddress.value ?: "Unknown"
+
+                    if (rawResult.startsWith("Success:")) {
+                        isSuccessResult.value = true
+                        executionResult.value = parseSuccessMessage(rawResult, currentIp)
+                    }
+                }
+            }
+        }
+        viewModelScope.launch {
+            VpnStatusManager.vpnStatus.collect { isConnected ->
+                _vpnStatus.value = isConnected
+                updateConnectionStatus(isConnected)
+            }
+        }
+    }
+
+    fun refreshIpManually() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val ip = fetchRealIp()
+            withContext(Dispatchers.Main) {
+                liveIpAddress.value = ip
+            }
+        }
+    }
+
+    private fun fetchRealIp(): String? {
+        return try {
+            URL("http://37.32.5.34:81").readText().trim()
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    fun setUpdateInterval(minutes: Int) {
+        updateIntervalMinutes.intValue = minutes
+        prefs.edit { putInt("update_interval", minutes) }
+    }
+
+    fun toggleAutoUpdateService() {
+        if (isAutoUpdateActive.value) {
+            stopService()
+        } else {
+            startService()
+        }
+    }
+
+    private fun startService() {
+        if (userToken.value.isBlank()) {
+            viewModelScope.launch {
+                val message = Localization.getString("please_enter_a_token", this@MainViewModel)
+                _toastEvent.emit(ToastData(message, ToastType.ERROR))
+            }
+            isAutoUpdateEnabledToggle.value = false
+            return
+        }
+        prefs.edit { putString("saved_auto_update_token", userToken.value) }
+        val context = getApplication<Application>().applicationContext
+        val intent = Intent(context, IpUpdateService::class.java).apply {
+            putExtra(IpUpdateService.EXTRA_TOKEN, userToken.value)
+            putExtra(IpUpdateService.EXTRA_INTERVAL, updateIntervalMinutes.intValue)
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+
+        viewModelScope.launch {
+            val message = Localization.getString("service_started", this@MainViewModel)
+            _toastEvent.emit(ToastData(message, ToastType.SUCCESS))
+        }
+    }
+
+    private fun stopService() {
+        val context = getApplication<Application>().applicationContext
+        val intent = Intent(context, IpUpdateService::class.java).apply {
+            action = IpUpdateService.ACTION_STOP_SERVICE
+        }
+        context.startService(intent)
+
+        viewModelScope.launch {
+            val message = Localization.getString("service_stopped", this@MainViewModel)
+            _toastEvent.emit(ToastData(message, ToastType.INFO))
+        }
+    }
+
+    fun submitTokenManually() {
+        prefs.edit { putString("saved_auto_update_token", userToken.value) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val ip = fetchRealIp() ?: liveIpAddress.value ?: "Unknown"
+                withContext(Dispatchers.Main) { liveIpAddress.value = ip }
+
+                val result = sendTokenRequest(userToken.value, ip)
+
+                withContext(Dispatchers.Main) {
+                    if (result.startsWith("Success:")) {
+                        lastRegisteredIp = ip
+                        isSuccessResult.value = true
+                        executionResult.value = parseSuccessMessage(result, ip)
+
+                        val message = Localization.getString("request_successful", this@MainViewModel)
+                        _toastEvent.emit(ToastData(message, ToastType.SUCCESS))
+
+                        if (isAutoUpdateEnabledToggle.value) {
+                            startService()
+                        }
+                    } else {
+                        isSuccessResult.value = false
+                        val errorMsg = result.substringAfter("Error: ")
+                        executionResult.value = "❌ Failed: $errorMsg"
+
+                        val message = Localization.getString("request_failed", this@MainViewModel)
+                        _toastEvent.emit(ToastData("$message: $errorMsg", ToastType.ERROR))
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    isSuccessResult.value = false
+                    executionResult.value = "❌ Error: ${e.message}"
+                    _toastEvent.emit(ToastData("Error: ${e.message}", ToastType.ERROR))
+                }
+            }
+        }
+    }
+
+    private fun parseSuccessMessage(rawResult: String, ip: String): String {
+        val jsonPart = rawResult.substringAfter("Success: ").trim()
+        val message = extractJsonValue(jsonPart, "message") ?: "OK"
+        val username = extractJsonValue(jsonPart, "username") ?: "-"
+        val activeIps = extractJsonValueInt(jsonPart, "active_ips") ?: 0
+        val lastIp = extractJsonValue(jsonPart, "last_ip") ?: "N/A"
+        val limitation = extractJsonValueInt(jsonPart, "limitation") ?: 0
+
+        return """
+            👤 Username: $username
+            🌐 IP Address: $ip
+            📍 Last IP: $lastIp
+            📊 Status: $message
+            🔢 Active IPs: $activeIps / $limitation
+        """.trimIndent()
     }
 
     fun isDarkThemeEnabled(): Boolean {
@@ -306,18 +514,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 when (serverId) {
                     "free" -> {
                         _freeSecondaryStatus.value = "pinging"
-                        _freeSecondaryTime.value = null
-                        _freeSecondaryError.value = null
                     }
                     "pro" -> {
                         _proSecondaryStatus.value = "pinging"
-                        _proSecondaryTime.value = null
-                        _proSecondaryError.value = null
                     }
                     else -> {
                         server.secondaryPingStatus = "pinging"
-                        server.secondaryPingTime = null
-                        server.secondaryPingError = null
                     }
                 }
 
@@ -354,61 +556,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun pingSecondaryOnly(serverId: String) {
         viewModelScope.launch {
             val server = when (serverId) {
-                "free" -> DnsServerGroup(
-                    id = "free",
-                    name = "Free DNS",
-                    primaryAddress = "37.32.5.60",
-                    secondaryAddress = "37.32.5.61",
-                    type = "free"
-                )
-                "pro" -> DnsServerGroup(
-                    id = "pro",
-                    name = "Pro DNS",
-                    primaryAddress = "37.32.5.34",
-                    secondaryAddress = "37.32.5.35",
-                    type = "pro"
-                )
+                "free" -> DnsServerGroup("free", "Free DNS", "37.32.5.60", "37.32.5.61", "free")
+                "pro" -> DnsServerGroup("pro", "Pro DNS", "37.32.5.34", "37.32.5.35", "pro")
                 else -> _customDnsGroups.find { it.id == serverId }
             } ?: return@launch
 
             if (server.secondaryAddress != null) {
-                when (serverId) {
-                    "free" -> {
-                        _freeSecondaryStatus.value = "pinging"
-                        _freeSecondaryTime.value = null
-                        _freeSecondaryError.value = null
-                    }
-                    "pro" -> {
-                        _proSecondaryStatus.value = "pinging"
-                        _proSecondaryTime.value = null
-                        _proSecondaryError.value = null
-                    }
-                    else -> {
-                        server.secondaryPingStatus = "pinging"
-                        server.secondaryPingTime = null
-                        server.secondaryPingError = null
-                    }
-                }
-
                 val result = withContext(Dispatchers.IO) {
                     executePingCommand(server.secondaryAddress)
                 }
-
                 when (serverId) {
                     "free" -> {
                         _freeSecondaryStatus.value = if (result.success) "success" else "failed"
                         _freeSecondaryTime.value = result.time
-                        _freeSecondaryError.value = result.error
                     }
                     "pro" -> {
                         _proSecondaryStatus.value = if (result.success) "success" else "failed"
                         _proSecondaryTime.value = result.time
-                        _proSecondaryError.value = result.error
                     }
                     else -> {
                         server.secondaryPingStatus = if (result.success) "success" else "failed"
                         server.secondaryPingTime = result.time
-                        server.secondaryPingError = result.error
                     }
                 }
                 _pingUpdateTrigger.value++
@@ -431,12 +599,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     try {
                         val socket = java.net.Socket()
                         val port = 53
-
                         val connectStart = System.currentTimeMillis()
                         socket.connect(java.net.InetSocketAddress(address, port), 3000)
                         val connectEnd = System.currentTimeMillis()
                         socket.close()
-
                         val timeMs = connectEnd - connectStart
                         PingResult(success = true, time = "${timeMs}ms", error = "TCP Connected")
                     } catch (_: Exception) {
@@ -449,21 +615,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-
-    private val _freePrimaryStatus = MutableStateFlow("idle")
-    private val _freePrimaryTime = MutableStateFlow<String?>(null)
-    private val _freePrimaryError = MutableStateFlow<String?>(null)
-    private val _freeSecondaryStatus = MutableStateFlow("idle")
-    private val _freeSecondaryTime = MutableStateFlow<String?>(null)
-    private val _freeSecondaryError = MutableStateFlow<String?>(null)
-
-    private val _proPrimaryStatus = MutableStateFlow("idle")
-    private val _proPrimaryTime = MutableStateFlow<String?>(null)
-    private val _proPrimaryError = MutableStateFlow<String?>(null)
-    private val _proSecondaryStatus = MutableStateFlow("idle")
-    private val _proSecondaryTime = MutableStateFlow<String?>(null)
-    private val _proSecondaryError = MutableStateFlow<String?>(null)
-
     fun getPrimaryPingStatus(serverId: String): String {
         return when (serverId) {
             "free" -> _freePrimaryStatus.value
@@ -471,7 +622,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             else -> _customDnsGroups.find { it.id == serverId }?.primaryPingStatus ?: "idle"
         }
     }
-
     fun getPrimaryPingTime(serverId: String): String? {
         return when (serverId) {
             "free" -> _freePrimaryTime.value
@@ -479,7 +629,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             else -> _customDnsGroups.find { it.id == serverId }?.primaryPingTime
         }
     }
-
     fun getPrimaryPingError(serverId: String): String? {
         return when (serverId) {
             "free" -> _freePrimaryError.value
@@ -487,7 +636,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             else -> _customDnsGroups.find { it.id == serverId }?.primaryPingError
         }
     }
-
     fun getSecondaryPingStatus(serverId: String): String {
         return when (serverId) {
             "free" -> _freeSecondaryStatus.value
@@ -495,7 +643,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             else -> _customDnsGroups.find { it.id == serverId }?.secondaryPingStatus ?: "idle"
         }
     }
-
     fun getSecondaryPingTime(serverId: String): String? {
         return when (serverId) {
             "free" -> _freeSecondaryTime.value
@@ -503,7 +650,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             else -> _customDnsGroups.find { it.id == serverId }?.secondaryPingTime
         }
     }
-
     fun getSecondaryPingError(serverId: String): String? {
         return when (serverId) {
             "free" -> _freeSecondaryError.value
@@ -549,25 +695,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private val _vpnStatus = MutableStateFlow(false)
-    val vpnStatus: StateFlow<Boolean> = _vpnStatus
-
-    init {
-        viewModelScope.launch {
-            VpnStatusManager.vpnStatus.collect { isConnected ->
-                _vpnStatus.value = isConnected
-                updateConnectionStatus(isConnected)
-            }
-        }
-    }
-
     private fun updateConnectionStatus(isConnected: Boolean) {
         if (isConnected) connect() else disconnect()
     }
 
     fun connect() {
         isConnected = true
-        timerSeconds = 0L
+
         initialTxBytes = android.net.TrafficStats.getTotalTxBytes()
         initialRxBytes = android.net.TrafficStats.getTotalRxBytes()
         totalUploadBytes = 0L
@@ -578,6 +712,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun disconnect() {
         isConnected = false
         stopTimer()
+        timerSeconds = 0L
         initialTxBytes = 0L
         initialRxBytes = 0L
     }
@@ -598,21 +733,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             currentRx - initialRxBytes
         else 0L
     }
+
     @SuppressLint("DefaultLocale")
     fun formatTraffic(bytes: Long): String {
         return when {
-            bytes >= 1024 * 1024 * 1024 -> {
-                String.format("%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0))
-            }
-            bytes >= 1024 * 1024 -> {
-                String.format("%.2f MB", bytes / (1024.0 * 1024.0))
-            }
-            bytes >= 1024 -> {
-                String.format("%.2f KB", bytes / 1024.0)
-            }
-            else -> {
-                "$bytes B"
-            }
+            bytes >= 1024 * 1024 * 1024 -> String.format("%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0))
+            bytes >= 1024 * 1024 -> String.format("%.2f MB", bytes / (1024.0 * 1024.0))
+            bytes >= 1024 -> String.format("%.2f KB", bytes / 1024.0)
+            else -> "$bytes B"
         }
     }
 }
